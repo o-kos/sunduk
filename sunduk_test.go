@@ -106,28 +106,32 @@ func TestSunduk_PutNilValue(t *testing.T) {
 func TestSunduk_PutAll(t *testing.T) {
 	store := New(TestStoreFile)
 	defer deleteTestStoreFile()
-	//entries := map[string][]byte{
-	//	"1": []byte("apple"),
-	//	"2": []byte("banana"),
-	//	"3": []byte("orange"),
-	//}
-	//checkKeyNotExists(t, store, "1")
-	//checkKeyNotExists(t, store, "2")
-	//checkKeyNotExists(t, store, "3")
-	//_ = store.PutAll(entries)
-	//checkValueForKey(t, store, "1", []byte("apple"))
-	//checkValueForKey(t, store, "2", []byte("banana"))
-	//checkValueForKey(t, store, "3", []byte("orange"))
-	//store.Close()
-
-	fns := []string{"ALE2G", "ALE3G", "Chn4x4", "clew", "Clover2000"}
-	values := make(map[string][]byte)
-	for _, fn := range fns {
-		b, _ := ioutil.ReadFile(fn + ".dll")
-		values[fn] = b
+	entries := map[string][]byte{
+		"1": []byte("apple"),
+		"2": []byte("banana"),
+		"3": []byte("orange"),
 	}
-	_ = store.PutAll(values)
+	checkKeyNotExists(t, store, "1")
+	checkKeyNotExists(t, store, "2")
+	checkKeyNotExists(t, store, "3")
+	_ = store.PutAll(entries)
+	checkValueForKey(t, store, "1", []byte("apple"))
+	checkValueForKey(t, store, "2", []byte("banana"))
+	checkValueForKey(t, store, "3", []byte("orange"))
 	store.Close()
+
+	//fns := []string{
+	//	"ALE2G", "ALE3G", "Chn4x4", "clew", "Clover2000", "CODAN", "CW", "hfdl",
+	//	"IsrNavy", "MS110AB", "Olivia", "PactorII", "PactorIII", "Q15X25",
+	//	"s3k", "SG4285", "SitorArq", "SitorFec", "SpiderHF", "TWINPLEX",
+	//}
+	//values := make(map[string][]byte)
+	//for _, fn := range fns {
+	//	b, _ := ioutil.ReadFile("~dll/" + fn + ".dll")
+	//	values[fn] = b
+	//}
+	//_ = store.PutAll(values)
+	//store.Close()
 }
 
 func TestSunduk_PutThenDelete(t *testing.T) {

@@ -2,10 +2,10 @@ package sunduk
 
 import (
 	"bytes"
-	"compress/gzip"
 	"encoding/binary"
 	"encoding/gob"
 	"fmt"
+	"github.com/andybalholm/brotli"
 	"os"
 	"sort"
 )
@@ -51,6 +51,32 @@ func (store *Sunduk) Close() {
 // Get returns the value of a key as well as a bool that indicates whether an entry exists for that key
 func (store *Sunduk) Get(key string) (value []byte, ok bool) {
 	value, ok = store.data[key]
+	if ok {
+		return
+	}
+	entry, ok := store.index[key]
+	if !ok {
+		return
+	}
+
+	ok = false
+	_, err := store.file.Seek(entry.Offset+store.offset, 0)
+	if err != nil {
+		return
+	}
+
+	data := make([]byte, entry.Size)
+	data = data[:cap(data)]
+	n, err := store.file.Read(data)
+	if int64(n) != entry.Size || err != nil {
+		return
+	}
+
+	var zb bytes.Buffer
+	zr := brotli.NewReader(&zb)
+	_, _ = zr.Read(data)
+	value = zb.Bytes()
+	ok = true
 	return
 }
 
@@ -112,6 +138,49 @@ func (store *Sunduk) loadFromDisk() error {
 	}
 	// File doesn't exist, so we need to read it
 	store.file = file
+	return store.readHeader()
+}
+
+// readHeader read, decompress and unmarshall storage header
+func (store *Sunduk) readHeader() error {
+	makeErr := func(action string, err error) error {
+		return fmt.Errorf("unable to %s storage header: %v", action, err)
+	}
+
+	// Read compressed header size
+	var sb [4]byte
+	if n, err := store.file.Read(sb[:]); n != len(sb) || err != nil {
+		return makeErr("read size of", err)
+	}
+	cs := binary.BigEndian.Uint32(sb[:])
+
+	// Read decompressed header size
+	if n, err := store.file.Read(sb[:]); n != len(sb) || err != nil {
+		return makeErr("read size of", err)
+	}
+	us := binary.BigEndian.Uint32(sb[:])
+
+	// Read compressed header content
+	data := make([]byte, cs)
+	if n, err := store.file.Read(data[:]); uint32(n) != cs || err != nil {
+		return makeErr("read", err)
+	}
+	// Save offset of storage data
+	store.offset = int64(cs + 2*uint32(len(sb)))
+
+	// Decompress header
+	header := make([]byte, us)
+	zr := brotli.NewReader(bytes.NewReader(data))
+	if n, err := zr.Read(header); uint32(n) != us || err != nil {
+		return makeErr("decompress", err)
+	}
+
+	// Unmarshall header data
+	dec := gob.NewDecoder(bytes.NewBuffer(header))
+	if err := dec.Decode(&store.index); err != nil {
+		return makeErr("decode", err)
+	}
+
 	return nil
 }
 
@@ -161,13 +230,17 @@ func (store *Sunduk) save() error {
 	var offset int64 = 0
 	for _, k := range keys {
 		var zb bytes.Buffer
-		zw := gzip.NewWriter(&zb)
+		zw := brotli.NewWriter(&zb)
 		v := store.data[k]
-		_, _ = zw.Write(v)
+		c, err := zw.Write(v)
+		_ = zw.Close()
+		if (c == 0) || (err != nil) {
+			return err
+		}
 		store.data[k] = zb.Bytes()
 		//zb.Reset()
 		//zw.Reset(&zb)
-
+		fmt.Printf("%s: %d -> %d\n", k, c, zb.Len())
 		store.index[k] = entry{offset, int64(len(store.data[k]))}
 		offset += store.index[k].Size
 	}
@@ -181,8 +254,9 @@ func (store *Sunduk) save() error {
 	}
 
 	var zbb bytes.Buffer
-	gzw := gzip.NewWriter(&zbb)
+	gzw := brotli.NewWriter(&zbb)
 	_, _ = gzw.Write(buf.Bytes())
+	_ = gzw.Close()
 	_ = store.file.Close()
 	file, err := os.Create(store.FilePath)
 	if err != nil {
@@ -190,6 +264,8 @@ func (store *Sunduk) save() error {
 	}
 	var size [4]byte
 	binary.BigEndian.PutUint32(size[:], uint32(zbb.Len()))
+	_, _ = file.Write(size[:])
+	binary.BigEndian.PutUint32(size[:], uint32(buf.Len()))
 	_, _ = file.Write(size[:])
 	_, _ = file.Write(zbb.Bytes())
 

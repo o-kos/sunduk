@@ -5,6 +5,7 @@
 *.dylib
 sunduk.data
 sunduk.data.bak
+~*
 
 # Test binary, built with `go test -c`
 *.test
