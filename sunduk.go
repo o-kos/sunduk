@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"github.com/andybalholm/brotli"
 	"io"
-	"math/rand"
+	"io/ioutil"
 	"os"
 	"sort"
 	"strings"
@@ -161,7 +161,7 @@ func (store *Sunduk) readHeader() error {
 	if n, err := store.file.Read(sb[:]); n != len(sb) || err != nil {
 		return makeErr("read size of", err)
 	}
-	us := binary.BigEndian.Uint32(sb[:])
+	//us := binary.BigEndian.Uint32(sb[:])
 
 	// Read compressed header content
 	data := make([]byte, cs)
@@ -172,9 +172,10 @@ func (store *Sunduk) readHeader() error {
 	store.offset = int64(cs + 2*uint32(len(sb)))
 
 	// Decompress header
-	header := make([]byte, us)
+	//header := make([]byte, us)
 	zr := brotli.NewReader(bytes.NewReader(data))
-	if n, err := zr.Read(header); uint32(n) != us || err != nil {
+	header, err := ioutil.ReadAll(zr)
+	if err != nil {
 		return makeErr("decompress", err)
 	}
 
@@ -191,24 +192,39 @@ func (store *Sunduk) readHeader() error {
 // The function is executed on creation, but can also be executed manually if storage space is a concern.
 // The original file is backed up
 func (store *Sunduk) flush() error {
+	// Create new file for saving data
+	newname := store.FilePath + ".new"
+	file, err := os.Create(newname)
+	if err != nil {
+		return err
+	}
+	defer func(file *os.File) {
+		_ = file.Close()
+		_ = os.Remove(newname)
+	}(file)
+
+	// Save storage contents on disk
+	if err := store.save(file); err != nil {
+		return fmt.Errorf("unable to create %s file for flushing: %s", newname, err.Error())
+	}
+	if err := file.Close(); err != nil {
+		return fmt.Errorf("unable to close %s file after flushing: %s", newname, err.Error())
+	}
+
 	// Back up the old file before doing the flushing
 	store.Close()
 	bakname := store.FilePath + ".bak"
-	err := os.Rename(store.FilePath, bakname)
-	if err != nil {
-		return fmt.Errorf(
-			"unable to rename %s to %s during flushing: %s", store.FilePath, bakname, err.Error(),
-		)
+	if err := os.Rename(store.FilePath, bakname); err != nil {
+		return fmt.Errorf("unable to rename %s to %s during flushing: %s", store.FilePath, bakname, err.Error())
 	}
+	defer func(file *os.File) {
+		_ = os.Remove(bakname)
+	}(file)
 
-	err = store.save()
-	_ = os.Remove(bakname)
-	if err != nil {
-		_ = os.Rename(bakname, store.FilePath)
+	if err := os.Rename(newname, store.FilePath); err != nil {
 		return fmt.Errorf("unable to save new file at %s during flushing: %s", store.FilePath, err.Error())
 	}
 
-	_ = os.Remove(bakname)
 	return nil
 }
 
@@ -235,10 +251,10 @@ func writeCompressed(file *os.File, data []byte) (n int, err error) {
 		return
 	}
 
-	// Write size of uncompressed data
-	if err = writeSize(file, uint32(len(data))); err != nil {
-		return
-	}
+	//// Write size of uncompressed data
+	//if err = writeSize(file, uint32(len(data))); err != nil {
+	//	return
+	//}
 
 	// Write compressed data
 	if n, err = file.Write(zb.Bytes()); n != zb.Len() || err != nil {
@@ -248,6 +264,15 @@ func writeCompressed(file *os.File, data []byte) (n int, err error) {
 	return
 }
 
+// writeHeader format header space for save data
+// Header format is
+// uint32 Count						- count of data chunks
+// uint32 Size of keys chunk		- compressed size of keys chunk
+// uint32 Size of first data chunk  - compressed size of data chunk
+// uint32 Size of next data chunk
+// ...
+// uint32 Size of last  data chunk  - compressed size of data chunk
+//
 func writeHeader(file *os.File, keys []string) (n int, err error) {
 	// Write count of data chunks
 	if err = writeSize(file, uint32(len(keys))); err != nil {
@@ -263,6 +288,18 @@ func writeHeader(file *os.File, keys []string) (n int, err error) {
 	// Write join & compressed keys
 	keyStr := strings.Join(keys, "#")
 	if n, err = writeCompressed(file, []byte(keyStr)); err != nil {
+		return
+	}
+	ks := uint32(n)
+
+	// Write compressed size of header in begin of index table
+	if _, err = file.Seek(4, io.SeekStart); err != nil {
+		return
+	}
+	if err = writeSize(file, ks); err != nil {
+		return
+	}
+	if _, err = file.Seek(0, io.SeekEnd); err != nil {
 		return
 	}
 
@@ -301,43 +338,11 @@ func (store *Sunduk) save(file *os.File) error {
 	}
 
 	// Update header index
-	if _, err := file.Seek(4, io.SeekStart); err != nil {
+	if _, err := file.Seek(2*4, io.SeekStart); err != nil {
 		return err
 	}
 	for _, cs := range sizes {
-		var size [4]byte
-		binary.LittleEndian.PutUint32(size[:], cs)
-		if n, err := file.Write(size[:]); uint32(n) != cs || err != nil {
-			return err
-		}
-	}
-	var buf bytes.Buffer
-	enc := gob.NewEncoder(&buf)
-	err := enc.Encode(store.index)
-	if err != nil {
-		return err
-	}
-
-	var zbb bytes.Buffer
-	gzw := brotli.NewWriter(&zbb)
-	_, _ = gzw.Write(buf.Bytes())
-	_ = gzw.Close()
-	_ = store.file.Close()
-	file, err := os.Create(store.FilePath)
-	if err != nil {
-		return err
-	}
-	var size [4]byte
-	binary.BigEndian.PutUint32(size[:], uint32(zbb.Len()))
-	_, _ = file.Write(size[:])
-
-	binary.BigEndian.PutUint32(size[:], uint32(buf.Len()))
-	_, _ = file.Write(size[:])
-	_, _ = file.Write(zbb.Bytes())
-
-	for _, k := range keys {
-		s, err := file.Write(store.data[k])
-		if s == 0 || err != nil {
+		if err := writeSize(file, cs); err != nil {
 			return err
 		}
 	}
