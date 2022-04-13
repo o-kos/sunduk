@@ -6,8 +6,11 @@ import (
 	"encoding/gob"
 	"fmt"
 	"github.com/andybalholm/brotli"
+	"io"
+	"math/rand"
 	"os"
 	"sort"
+	"strings"
 )
 
 type entry struct {
@@ -209,13 +212,66 @@ func (store *Sunduk) flush() error {
 	return nil
 }
 
-// save make physical saving data on disk
-func (store *Sunduk) save() error {
-	// Load all from disk
-	//	for k, _ := range store.index {
-	//		store.index[k] = entry{0, int64(len(store.data[k]))}
-	//	}
+// writeCompressed compress and write data in file
+func writeSize(file *os.File, size uint32) error {
+	// Write size of uncompressed data
+	var sb [4]byte
+	binary.LittleEndian.PutUint32(sb[:], size)
+	if n, err := file.Write(sb[:]); uint32(n) != size || err != nil {
+		return err
+	}
 
+	return nil
+}
+
+// writeCompressed compress and write data in file
+func writeCompressed(file *os.File, data []byte) (n int, err error) {
+	// Compress data
+	var zb bytes.Buffer
+	zw := brotli.NewWriter(&zb)
+	_, err = zw.Write(data)
+	_ = zw.Close()
+	if err != nil {
+		return
+	}
+
+	// Write size of uncompressed data
+	if err = writeSize(file, uint32(len(data))); err != nil {
+		return
+	}
+
+	// Write compressed data
+	if n, err = file.Write(zb.Bytes()); n != zb.Len() || err != nil {
+		return
+	}
+
+	return
+}
+
+func writeHeader(file *os.File, keys []string) (n int, err error) {
+	// Write count of data chunks
+	if err = writeSize(file, uint32(len(keys))); err != nil {
+		return
+	}
+
+	// Write empty index table: compressed size of header & each date item
+	index := make([]byte, 0, (len(keys)+1)*4)
+	if n, err = file.Write(index); n != len(index) || err != nil {
+		return
+	}
+
+	// Write join & compressed keys
+	keyStr := strings.Join(keys, "#")
+	if n, err = writeCompressed(file, []byte(keyStr)); err != nil {
+		return
+	}
+
+	n += len(index) + len(keys)*4 + 4
+	return
+}
+
+// save make physical saving data on disk
+func (store *Sunduk) save(file *os.File) error {
 	// Sort keys
 	keys := make([]string, 0, len(store.index))
 	for k := range store.index {
@@ -223,29 +279,38 @@ func (store *Sunduk) save() error {
 	}
 	sort.Strings(keys)
 
-	// Pack data & Recalc offsets
-	//var zb bytes.Buffer
-	//zw, _ := flate.NewWriter(&zb, flate.DefaultCompression)
-	//zw := gzip.NewWriter(&zb)
-	var offset int64 = 0
-	for _, k := range keys {
-		var zb bytes.Buffer
-		zw := brotli.NewWriter(&zb)
-		v := store.data[k]
-		c, err := zw.Write(v)
-		_ = zw.Close()
-		if (c == 0) || (err != nil) {
-			return err
-		}
-		store.data[k] = zb.Bytes()
-		//zb.Reset()
-		//zw.Reset(&zb)
-		fmt.Printf("%s: %d -> %d\n", k, c, zb.Len())
-		store.index[k] = entry{offset, int64(len(store.data[k]))}
-		offset += store.index[k].Size
+	if _, err := writeHeader(file, keys); err != nil {
+		return err
 	}
 
-	//Save header
+	// Pack data & recalc offsets
+	sizes := make([]uint32, len(keys))
+	for i, k := range keys {
+		value, ok := store.data[k]
+		if !ok {
+			value, ok = store.Get(k)
+			if !ok {
+				return fmt.Errorf("storage consistancy is broken: value for key %q is not found", k)
+			}
+		}
+		n, err := writeCompressed(file, value)
+		if err != nil {
+			return err
+		}
+		sizes[i] = uint32(n)
+	}
+
+	// Update header index
+	if _, err := file.Seek(4, io.SeekStart); err != nil {
+		return err
+	}
+	for _, cs := range sizes {
+		var size [4]byte
+		binary.LittleEndian.PutUint32(size[:], cs)
+		if n, err := file.Write(size[:]); uint32(n) != cs || err != nil {
+			return err
+		}
+	}
 	var buf bytes.Buffer
 	enc := gob.NewEncoder(&buf)
 	err := enc.Encode(store.index)
@@ -265,6 +330,7 @@ func (store *Sunduk) save() error {
 	var size [4]byte
 	binary.BigEndian.PutUint32(size[:], uint32(zbb.Len()))
 	_, _ = file.Write(size[:])
+
 	binary.BigEndian.PutUint32(size[:], uint32(buf.Len()))
 	_, _ = file.Write(size[:])
 	_, _ = file.Write(zbb.Bytes())
