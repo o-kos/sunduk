@@ -104,6 +104,7 @@ func TestSunduk_PutNilValue(t *testing.T) {
 }
 
 func TestSunduk_PutAll(t *testing.T) {
+	deleteTestStoreFile()
 	store := New(TestStoreFile)
 	defer deleteTestStoreFile()
 	entries := map[string][]byte{
@@ -115,10 +116,11 @@ func TestSunduk_PutAll(t *testing.T) {
 	checkKeyNotExists(t, store, "2")
 	checkKeyNotExists(t, store, "3")
 	_ = store.PutAll(entries)
+	store.Close()
+	store = New(TestStoreFile)
 	checkValueForKey(t, store, "1", []byte("apple"))
 	checkValueForKey(t, store, "2", []byte("banana"))
 	checkValueForKey(t, store, "3", []byte("orange"))
-	store.Close()
 
 	//fns := []string{
 	//	"ALE2G", "ALE3G", "Chn4x4", "clew", "Clover2000", "CODAN", "CW", "hfdl",

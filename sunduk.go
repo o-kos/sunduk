@@ -3,7 +3,6 @@ package sunduk
 import (
 	"bytes"
 	"encoding/binary"
-	"encoding/gob"
 	"fmt"
 	"github.com/andybalholm/brotli"
 	"io"
@@ -15,16 +14,15 @@ import (
 
 type entry struct {
 	Offset int64
-	Size   int64
+	Size   int32
 }
 
 type Sunduk struct {
 	FilePath string // FilePath is the path to the file used to persist
 
-	file   *os.File
-	offset int64
-	data   map[string][]byte
-	index  map[string]entry
+	file  *os.File
+	data  map[string][]byte
+	index map[string]entry
 }
 
 // New creates a new Sunduk
@@ -63,7 +61,7 @@ func (store *Sunduk) Get(key string) (value []byte, ok bool) {
 	}
 
 	ok = false
-	_, err := store.file.Seek(entry.Offset+store.offset, 0)
+	_, err := store.file.Seek(entry.Offset, 0)
 	if err != nil {
 		return
 	}
@@ -71,7 +69,7 @@ func (store *Sunduk) Get(key string) (value []byte, ok bool) {
 	data := make([]byte, entry.Size)
 	data = data[:cap(data)]
 	n, err := store.file.Read(data)
-	if int64(n) != entry.Size || err != nil {
+	if int32(n) != entry.Size || err != nil {
 		return
 	}
 
@@ -85,7 +83,7 @@ func (store *Sunduk) Get(key string) (value []byte, ok bool) {
 
 // Put creates an entry or updates the value of an existing key
 func (store *Sunduk) Put(key string, value []byte) error {
-	store.index[key] = entry{0, int64(len(value))}
+	store.index[key] = entry{0, int32(len(value))}
 	store.data[key] = value
 	return store.flush()
 }
@@ -124,6 +122,7 @@ func (store *Sunduk) Keys() []string {
 
 // loadFromDisk loads the store from the disk and consolidates the entries, or creates an empty file if there is no file
 func (store *Sunduk) loadFromDisk() error {
+	store.index = make(map[string]entry)
 	store.data = make(map[string][]byte)
 	file, err := os.Open(store.FilePath)
 	if err != nil {
@@ -139,7 +138,7 @@ func (store *Sunduk) loadFromDisk() error {
 			return err
 		}
 	}
-	// File doesn't exist, so we need to read it
+	// File exist, so we need to read it
 	store.file = file
 	return store.readHeader()
 }
@@ -150,29 +149,41 @@ func (store *Sunduk) readHeader() error {
 		return fmt.Errorf("unable to %s storage header: %v", action, err)
 	}
 
-	// Read compressed header size
+	// Read count of keys in storage
 	var sb [4]byte
 	if n, err := store.file.Read(sb[:]); n != len(sb) || err != nil {
-		return makeErr("read size of", err)
+		return makeErr("read count of keys in", err)
 	}
-	cs := binary.BigEndian.Uint32(sb[:])
+	kc := binary.LittleEndian.Uint32(sb[:])
 
-	// Read decompressed header size
+	// Read compressed size of keys
 	if n, err := store.file.Read(sb[:]); n != len(sb) || err != nil {
-		return makeErr("read size of", err)
+		return makeErr("read size of keys chunk in", err)
 	}
-	//us := binary.BigEndian.Uint32(sb[:])
+	ks := binary.LittleEndian.Uint32(sb[:])
+
+	// Read compressed sizes of data chunks
+	sizes := make([]uint32, kc)
+	for i := uint32(0); i < kc; i++ {
+		if n, err := store.file.Read(sb[:]); n != len(sb) || err != nil {
+			return makeErr("read size of data chunk in", err)
+		}
+		sizes[i] = binary.LittleEndian.Uint32(sb[:])
+	}
 
 	// Read compressed header content
-	data := make([]byte, cs)
-	if n, err := store.file.Read(data[:]); uint32(n) != cs || err != nil {
+	data := make([]byte, ks)
+	if n, err := store.file.Read(data[:]); uint32(n) != ks || err != nil {
 		return makeErr("read", err)
 	}
+
 	// Save offset of storage data
-	store.offset = int64(cs + 2*uint32(len(sb)))
+	offset, err := store.file.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return makeErr("seek position in", err)
+	}
 
 	// Decompress header
-	//header := make([]byte, us)
 	zr := brotli.NewReader(bytes.NewReader(data))
 	header, err := ioutil.ReadAll(zr)
 	if err != nil {
@@ -180,10 +191,18 @@ func (store *Sunduk) readHeader() error {
 	}
 
 	// Unmarshall header data
-	dec := gob.NewDecoder(bytes.NewBuffer(header))
-	if err := dec.Decode(&store.index); err != nil {
-		return makeErr("decode", err)
+	keys := strings.Split(string(header), "#")
+	if uint32(len(keys)) != kc {
+		return makeErr("decode keys in", err)
 	}
+	for i, k := range keys {
+		store.index[k] = entry{offset, int32(sizes[i])}
+		offset += int64(sizes[i])
+	}
+	//dec := gob.NewDecoder(bytes.NewBuffer(header))
+	//if err := dec.Decode(&store.index); err != nil {
+	//	return makeErr("decode", err)
+	//}
 
 	return nil
 }
@@ -228,7 +247,7 @@ func (store *Sunduk) flush() error {
 	return nil
 }
 
-// writeCompressed compress and write data in file
+// writeSize compress and write data in file
 func writeSize(file *os.File, size uint32) error {
 	// Write size of uncompressed data
 	var sb [4]byte
@@ -280,7 +299,7 @@ func writeHeader(file *os.File, keys []string) (n int, err error) {
 	}
 
 	// Write empty index table: compressed size of header & each date item
-	index := make([]byte, 0, (len(keys)+1)*4)
+	index := make([]byte, (len(keys)+1)*4)
 	if n, err = file.Write(index); n != len(index) || err != nil {
 		return
 	}
@@ -303,7 +322,7 @@ func writeHeader(file *os.File, keys []string) (n int, err error) {
 		return
 	}
 
-	n += len(index) + len(keys)*4 + 4
+	n += len(index) + 4
 	return
 }
 
